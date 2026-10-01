@@ -99,6 +99,8 @@ class ImportOut(BaseModel):
     version: int
     node_count: int
     pipe_count: int
+    # 整网导入在同一事务内冻结的状态快照编号（增量字段，旧客户端可忽略）
+    snapshot_id: int | None = None
 
 
 class NetworkOut(BaseModel):
@@ -146,6 +148,7 @@ class SubmitOut(BaseModel):
     closed_pipe_ids: list[str]
     affected_sink_ids: list[str]
     event_id: int
+    snapshot_id: int | None = None
 
 
 class RestoreIn(BaseModel):
@@ -180,6 +183,7 @@ class RestoreOut(BaseModel):
     fault_pipe_id: str
     reopened_pipe_ids: list[str]
     restored_sink_ids: list[str]
+    snapshot_id: int | None = None
 
 
 class SourceTargetOut(BaseModel):
@@ -205,6 +209,8 @@ class SourceSwitchOut(BaseModel):
     targets: list[SourceTargetOut]
     affected_sink_ids: list[str]
     restored_sink_ids: list[str]
+    # 仅在确有状态变化时产生快照；全部目标状态已满足（changed=false）时为 null
+    snapshot_id: int | None = None
 
 
 class EventOut(BaseModel):
@@ -217,3 +223,129 @@ class EventOut(BaseModel):
     status: str = "open"
     restored_at: datetime | None = None
     created_at: datetime
+
+
+# ---------------------------------------------------------------- 状态快照
+
+
+class SnapshotNodeOut(BaseModel):
+    id: str
+    type: NodeType
+    name: str | None = None
+    running: bool = True
+
+
+class SnapshotPipeOut(BaseModel):
+    id: str
+    from_: str = Field(serialization_alias="from")
+    to_: str = Field(serialization_alias="to")
+    has_valve: bool
+    valve_closed: bool
+    name: str | None = None
+
+
+class SnapshotFaultOut(BaseModel):
+    event_id: int
+    fault_pipe_id: str
+
+
+class SnapshotStateOut(BaseModel):
+    """操作后冻结的完整供水状态（历史只读，绝不以后续状态回填）。"""
+
+    nodes: list[SnapshotNodeOut]
+    pipes: list[SnapshotPipeOut]
+    open_faults: list[SnapshotFaultOut]
+    supplied_sink_ids: list[str]
+
+
+class SnapshotOut(BaseModel):
+    """单条状态快照：编号 + 操作类型 + 当时管网版本 + 关联事件编号 + 冻结状态。"""
+
+    id: int
+    op_type: str
+    network_version: int
+    event_id: int | None = None
+    state: SnapshotStateOut
+    created_at: datetime
+
+
+class SnapshotMetaOut(BaseModel):
+    """快照列表项：与详情一致（列表与详情均返回冻结状态，便于调度员直接回看）。"""
+
+    id: int
+    op_type: str
+    network_version: int
+    event_id: int | None = None
+    state: SnapshotStateOut
+    created_at: datetime
+
+
+class SnapshotNodeChangeOut(BaseModel):
+    id: str
+    type: NodeType
+    name: str | None = None
+    running: bool = True
+
+
+class SnapshotPipeChangeOut(BaseModel):
+    id: str
+    from_: str = Field(serialization_alias="from")
+    to_: str = Field(serialization_alias="to")
+    has_valve: bool
+    valve_closed: bool
+    name: str | None = None
+
+
+class SnapshotNodeDiffOut(BaseModel):
+    added: list[SnapshotNodeChangeOut]
+    removed: list[SnapshotNodeChangeOut]
+
+
+class SnapshotPipeDiffOut(BaseModel):
+    added: list[SnapshotPipeChangeOut]
+    removed: list[SnapshotPipeChangeOut]
+
+
+class ValvePositionChangeOut(BaseModel):
+    pipe_id: str
+    valve_closed_before: bool
+    valve_closed_after: bool
+
+
+class ValvePositionDiffOut(BaseModel):
+    changed: list[ValvePositionChangeOut]
+
+
+class SourceStateChangeOut(BaseModel):
+    source_id: str
+    running_before: bool
+    running_after: bool
+
+
+class SourceStateDiffOut(BaseModel):
+    changed: list[SourceStateChangeOut]
+
+
+class SnapshotFaultDiffOut(BaseModel):
+    added: list[SnapshotFaultOut]
+    removed: list[SnapshotFaultOut]
+
+
+class SuppliedSinksDiffOut(BaseModel):
+    added: list[str]
+    removed: list[str]
+
+
+class SnapshotDiffOut(BaseModel):
+    """相邻快照的六类净变化（节点/管段/阀位/水源状态/待修复故障/供水点）。"""
+
+    base_snapshot_id: int | None
+    target_snapshot_id: int
+    base_network_version: int | None
+    target_network_version: int
+    nodes: SnapshotNodeDiffOut
+    pipes: SnapshotPipeDiffOut
+    valve_positions: ValvePositionDiffOut
+    source_states: SourceStateDiffOut
+    open_faults: SnapshotFaultDiffOut
+    supplied_sinks: SuppliedSinksDiffOut

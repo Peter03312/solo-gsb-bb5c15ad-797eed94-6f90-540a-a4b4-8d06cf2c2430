@@ -12,10 +12,15 @@
 - POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
+
+状态回看（快照）：
+- GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
+- GET  /api/snapshots/{snapshot_id}                    按编号读取冻结快照（节点/水源/阀位/待修复故障/供水点）
+- GET  /api/snapshots/{snapshot_id}/diff               与相邻上一条快照的六类净变化（可用 base_id 指定对照基线）
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import db
@@ -23,6 +28,7 @@ from .config import get_settings
 from .planning import (
     Node,
     Pipe,
+    diff_states,
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
@@ -46,6 +52,9 @@ from .schemas import (
     SourceSwitchPreviewOut,
     SourceSwitchOut,
     EventOut,
+    SnapshotOut,
+    SnapshotMetaOut,
+    SnapshotDiffOut,
 )
 from .serializers import (
     serialize_preview,
@@ -53,6 +62,8 @@ from .serializers import (
     serialize_restore_preview,
     serialize_source_switch_preview,
     serialize_snapshot,
+    serialize_snapshot_row,
+    serialize_snapshot_diff,
 )
 
 
@@ -147,12 +158,13 @@ def import_network(payload: ImportIn):
         )
 
     with db.transaction() as conn:
-        version = db.replace_network(conn, nodes, pipes)
+        version, snapshot_id = db.replace_network(conn, nodes, pipes)
 
     return {
         "version": version,
         "node_count": len(nodes),
         "pipe_count": len(pipes),
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -274,6 +286,7 @@ def submit_isolation(payload: PlanIn):
         "closed_pipe_ids": close_ids,
         "affected_sink_ids": result.affected_sink_ids,
         "event_id": outcome["event_id"],
+        "snapshot_id": outcome["snapshot_id"],
     }
 
 
@@ -368,6 +381,7 @@ def restore_confirm(event_id: int, payload: RestoreIn):
         "fault_pipe_id": event["fault_pipe_id"],
         "reopened_pipe_ids": reopen_ids,
         "restored_sink_ids": result.restored_sink_ids,
+        "snapshot_id": outcome["snapshot_id"],
     }
 
 
@@ -390,7 +404,7 @@ def _load_source_switch_context(conn, payload: SourceSwitchIn, *, for_update: bo
     return version, result, targets
 
 
-def _switch_response_body(version: int, targets, result) -> dict:
+def _switch_response_body(version: int, targets, result, snapshot_id: int | None = None) -> dict:
     return {
         "version": version,
         "changed": result.changed,
@@ -400,6 +414,8 @@ def _switch_response_body(version: int, targets, result) -> dict:
         ],
         "affected_sink_ids": result.affected_sink_ids,
         "restored_sink_ids": result.restored_sink_ids,
+        # 全部目标状态已满足（无实际变化）时不产生快照，恒为 null
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -439,9 +455,9 @@ def source_switch_confirm(payload: SourceSwitchIn):
                 issues=result.issues,
             )
 
-        # 全部目标状态已满足：不推进版本，直接回显当前状态
+        # 全部目标状态已满足：不推进版本、不产生快照，直接回显当前状态
         if not result.changed:
-            return _switch_response_body(version, targets, result)
+            return _switch_response_body(version, targets, result, snapshot_id=None)
 
         if not result.safe:
             raise ApiError(
@@ -455,4 +471,97 @@ def source_switch_confirm(payload: SourceSwitchIn):
             conn, expected_version=payload.version, targets=targets
         )
 
-    return _switch_response_body(outcome["version"], targets, result)
+    return _switch_response_body(
+        outcome["version"], targets, result, outcome["snapshot_id"]
+    )
+
+
+# ---------------------------------------------------------------- 状态快照回看
+
+
+def _get_snapshot_or_404(conn, snapshot_id: int) -> dict:
+    row = db.get_state_snapshot(conn, snapshot_id)
+    if row is None:
+        raise ApiError(
+            404,
+            "SNAPSHOT_NOT_FOUND",
+            f"状态快照不存在：{snapshot_id}（快照编号不可复用，请核对编号后重试）",
+        )
+    return row
+
+
+@app.get(
+    "/api/snapshots",
+    response_model=list[SnapshotMetaOut],
+    tags=["状态快照"],
+    summary="状态快照列表（按编号升序；after 为分页游标）",
+)
+def list_snapshots(
+    limit: int = Query(default=100, ge=1, le=500, description="单次返回上限（1-500）"),
+    after_id: int | None = Query(
+        default=None, ge=1, description="游标：只返回编号严格大于该值的快照"
+    ),
+):
+    with db.get_conn() as conn:
+        rows = db.list_state_snapshots(conn, limit=limit, after_id=after_id)
+    return [serialize_snapshot_row(r) for r in rows]
+
+
+@app.get(
+    "/api/snapshots/{snapshot_id}",
+    response_model=SnapshotOut,
+    tags=["状态快照"],
+    summary="按编号读取冻结快照：节点、水源运行状态、管段阀位、待修复故障、由运行水源可达的用水点",
+)
+def get_snapshot(snapshot_id: int):
+    with db.get_conn() as conn:
+        row = _get_snapshot_or_404(conn, snapshot_id)
+    return serialize_snapshot_row(row)
+
+
+@app.get(
+    "/api/snapshots/{snapshot_id}/diff",
+    response_model=SnapshotDiffOut,
+    tags=["状态快照"],
+    summary="相邻快照对照：节点/管段/阀位/水源状态/待修复故障/供水点的净变化",
+)
+def diff_snapshot(
+    snapshot_id: int,
+    base_id: int | None = Query(
+        default=None,
+        ge=1,
+        description="对照基线快照编号；缺省为目标快照相邻的上一条快照。"
+        "首条快照无基线时，目标状态全部计为新增。",
+    ),
+):
+    with db.get_conn() as conn:
+        target = _get_snapshot_or_404(conn, snapshot_id)
+        if base_id is not None:
+            base = db.get_state_snapshot(conn, base_id)
+            if base is None:
+                raise ApiError(
+                    404,
+                    "SNAPSHOT_NOT_FOUND",
+                    f"对照基线状态快照不存在：{base_id}",
+                )
+            if base_id >= snapshot_id:
+                raise ApiError(
+                    422,
+                    "SNAPSHOT_DIFF_INVALID",
+                    "对照基线快照编号必须小于目标快照编号，且两条快照须相邻",
+                )
+            previous = db.get_previous_state_snapshot(conn, snapshot_id)
+            previous_id = previous["id"] if previous else None
+            if previous_id != base_id:
+                raise ApiError(
+                    422,
+                    "SNAPSHOT_NOT_ADJACENT",
+                    f"快照 {base_id} 与 {snapshot_id} 不相邻："
+                    f"{snapshot_id} 相邻的上一条快照为 {previous_id}",
+                )
+        else:
+            base = db.get_previous_state_snapshot(conn, snapshot_id)
+
+    # 只基于两份冻结载荷计算，绝不读取当前管网或后续事件回填
+    diff = diff_states(base["state"] if base else None, target["state"])
+    return serialize_snapshot_diff(base, target, diff)

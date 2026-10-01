@@ -8,7 +8,6 @@ from .planning import (
     SourceSwitchResult,
 )
 
-
 def serialize_node(node: Node) -> dict:
     return {"id": node.id, "type": node.type, "name": node.name, "running": node.running}
 
@@ -105,4 +104,106 @@ def serialize_source_switch_preview(
         "restored_sink_ids": list(result.restored_sink_ids),
         "block_reasons": [b.as_dict() for b in result.blocks],
         "issues": [i.as_dict() for i in result.issues],
+    }
+
+
+# ---------------------------------------------------------------- 状态快照
+
+
+def serialize_frozen_state(state: dict) -> dict:
+    """冻结载荷 -> 响应结构（管段键名 from/to；与 GET /api/network 口径一致）。"""
+    nodes = [
+        {
+            "id": n["id"],
+            "type": n["type"],
+            "name": n.get("name"),
+            "running": n["running"],
+        }
+        for n in state.get("nodes", [])
+    ]
+    pipes = [
+        {
+            "id": p["id"],
+            "from_": p["from"],
+            "to_": p["to"],
+            "has_valve": p["has_valve"],
+            "valve_closed": p["valve_closed"],
+            "name": p.get("name"),
+        }
+        for p in state.get("pipes", [])
+    ]
+    return {
+        "nodes": nodes,
+        "pipes": pipes,
+        "open_faults": [
+            {"event_id": f["event_id"], "fault_pipe_id": f["fault_pipe_id"]}
+            for f in state.get("open_faults", [])
+        ],
+        "supplied_sink_ids": list(state.get("supplied_sink_ids", [])),
+    }
+
+
+def serialize_snapshot_row(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "op_type": row["op_type"],
+        "network_version": row["network_version"],
+        "event_id": row["event_id"],
+        "state": serialize_frozen_state(row["state"]),
+        "created_at": row["created_at"],
+    }
+
+
+def serialize_snapshot_diff(
+    base_row: dict | None, target_row: dict, diff: dict
+) -> dict:
+    def _pipe(p: dict) -> dict:
+        return {
+            "id": p["id"],
+            "from_": p["from"],
+            "to_": p["to"],
+            "has_valve": p["has_valve"],
+            "valve_closed": p["valve_closed"],
+            "name": p.get("name"),
+        }
+
+    def _node(n: dict) -> dict:
+        return {
+            "id": n["id"],
+            "type": n["type"],
+            "name": n.get("name"),
+            "running": n["running"],
+        }
+
+    return {
+        "base_snapshot_id": base_row["id"] if base_row else None,
+        "target_snapshot_id": target_row["id"],
+        "base_network_version": (
+            base_row["network_version"] if base_row else None
+        ),
+        "target_network_version": target_row["network_version"],
+        "nodes": {
+            "added": [_node(n) for n in diff["nodes"]["added"]],
+            "removed": [_node(n) for n in diff["nodes"]["removed"]],
+        },
+        "pipes": {
+            "added": [_pipe(p) for p in diff["pipes"]["added"]],
+            "removed": [_pipe(p) for p in diff["pipes"]["removed"]],
+        },
+        "valve_positions": {"changed": list(diff["valve_positions"]["changed"])},
+        "source_states": {"changed": list(diff["source_states"]["changed"])},
+        "open_faults": {
+            "added": [
+                {"event_id": f["event_id"], "fault_pipe_id": f["fault_pipe_id"]}
+                for f in diff["open_faults"]["added"]
+            ],
+            "removed": [
+                {"event_id": f["event_id"], "fault_pipe_id": f["fault_pipe_id"]}
+                for f in diff["open_faults"]["removed"]
+            ],
+        },
+        "supplied_sinks": {
+            "added": list(diff["supplied_sinks"]["added"]),
+            "removed": list(diff["supplied_sinks"]["removed"]),
+        },
     }

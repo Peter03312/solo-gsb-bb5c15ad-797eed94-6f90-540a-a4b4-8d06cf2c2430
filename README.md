@@ -8,7 +8,10 @@
 操作员只知道**故障管段编号**时，可请求**关阀建议**：按当前管网只读计算一套可直接提交的关阀方案；
 针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
 隔离提交后生成带编号的隔离事件（区分**待修复 open / 已复供 restored**），
-修复完成后操作员按**事件编号 + 当前管网版本**预演并确认**复供**，系统复核重开阀门后其余待修复故障是否仍被安全隔离。
+修复完成后操作员按**事件编号 + 当前管网版本**预演并确认**复供**，系统复核重开阀门后其余待修复故障是否仍被安全隔离；
+**整网导入、隔离提交、复供确认、水源切换**每次实际改变状态时，在**同一事务**内冻结一条
+不可复用编号的**操作后状态快照**，供调度员按操作顺序回看当时的节点、水源运行状态、
+管段阀位、待修复故障与由运行水源可达的用水点，并支持相邻快照六类净变化对照。
 
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演）
 > 只以**运行中**的水源为供水起点；停运水源不再供水。
@@ -144,6 +147,30 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   明细在 `issues`；预演不拒绝，返回 200 并在 `issues` 中列出）、
   重新进水风险 `422 SOURCE_SWITCH_UNSAFE`。
 
+**状态快照（操作后回看）**（只增不改，编号由数据库序列全局单调分配，**不可复用**）：
+
+- 仅四类**实际改变状态**的写操作产生快照，且与状态变更在**同一事务**内冻结：
+  整网导入 `network_import`、隔离提交 `isolation_submit`、
+  复供确认 `restore_confirm`、水源切换 `source_switch`；
+- 每条快照记录：快照编号、操作类型、**当时管网版本**、关联事件编号
+  （仅隔离/复供有，其余为 `null`）与冻结的操作后状态；
+- 冻结状态包含：全部节点（含水源运行状态）、全部管段阀位、
+  当时全部**待修复故障**（事件编号 + 故障管段编号）、以及按与通水计算完全一致的口径
+  （仅运行水源、已关阀门与待修复故障管段阻断）得出的**由运行水源可达用水点**；
+- **整网导入不覆盖此前快照**：版本虽重置为 `1`，快照表不截断，编号继续单调递增；
+  快照载荷自包含（不引用事件表外键），故重新导入清空事件后旧快照依旧可读；
+- **操作失败、版本冲突、整批水源目标状态已满足（changed=false）不产生新快照**；
+  只读接口（预演、关阀建议、读网）从不产生快照；
+- **历史结果绝不以当前管网或后续事件回填**：读取与对照都只基于当时冻结的载荷；
+- **旧库上线**只在快照表为空且当前存在管网时，以**当下状态**建立一条
+  `baseline` 基线快照（记录当前版本与当前待修复故障），**不伪造**早期操作记录；
+  空库与已有快照的库不产生基线，建基线本身幂等；
+- 相邻快照对照输出六类**净变化**：节点新增/移除、管段新增/移除、
+  共有管段阀位开/关变化、共有水源运行状态变化、待修复故障新增/移除（按事件编号）、
+  可达用水点新增/移除；首条快照无更早基线时，其状态全部计为新增；
+  显式 `base_id` 必须与目标快照**相邻**，否则 `422 SNAPSHOT_NOT_ADJACENT`；
+  未知快照编号统一 `404 SNAPSHOT_NOT_FOUND`，绝不静默返回当前状态。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -159,6 +186,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/isolation/events/{event_id}/restore` | 复供确认（单事务复核 + 重开阀门） |
 | POST | `/api/sources/switch/preview` | 水源停运/恢复预演（只读：失供/恢复用水点、待修复故障重新进水风险） |
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
+| GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
+| GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
+| GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
 
 业务错误统一返回：
 
@@ -573,6 +603,115 @@ python3 examples/source_switch_demo.py http://localhost:8000
 全网停运 → 恢复供水 → 停运源下隔离故障 → 恢复水源的重新进水风险拒绝 →
 过期/非法请求拒绝 → 故障复供后安全恢复水源。
 
+### 10. 状态快照回看（调度员按操作顺序回看）
+
+四类写操作的成功响应都**增量返回**同一事务冻结的 `snapshot_id`（旧客户端可忽略，字段可空）：
+
+```bash
+# 整网导入 -> snapshot_id=1（network_import，版本重置为 1）
+curl -s -X POST http://localhost:8000/api/network/import \
+  -H 'Content-Type: application/json' -d @examples/sample_network.json
+# {"version":1,"node_count":7,"pipe_count":6,"snapshot_id":1}
+
+# 隔离提交 -> snapshot_id=2（isolation_submit，关联 event_id=1）
+curl -s -X POST http://localhost:8000/api/isolation/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","close_pipe_ids":["P4"],"version":1}'
+# {"version":2,...,"event_id":1,"snapshot_id":2}
+
+# 复供确认 -> snapshot_id=3（restore_confirm，关联同一事件）
+curl -s -X POST http://localhost:8000/api/isolation/events/1/restore \
+  -H 'Content-Type: application/json' -d '{"version":2}'
+# {"version":3,...,"snapshot_id":3}
+
+# 水源切换 -> snapshot_id=4（source_switch；目标状态全部已满足时 snapshot_id=null）
+curl -s -X POST http://localhost:8000/api/sources/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"targets":[{"source_id":"S","running":false}],"version":3}'
+# {"version":4,"changed":true,...,"snapshot_id":4}
+```
+
+列出快照（编号升序，支持游标分页）：
+
+```bash
+curl -s 'http://localhost:8000/api/snapshots?limit=100'
+curl -s 'http://localhost:8000/api/snapshots?after_id=2&limit=50'
+```
+
+按编号读取当时完整状态（历史只读，不被当前管网/后续事件回填）：
+
+```bash
+curl -s http://localhost:8000/api/snapshots/2
+```
+
+```json
+{
+  "id": 2,
+  "op_type": "isolation_submit",
+  "network_version": 2,
+  "event_id": 1,
+  "state": {
+    "nodes": [ ... ],
+    "pipes": [ ... ],
+    "open_faults": [{"event_id": 1, "fault_pipe_id": "P6"}],
+    "supplied_sink_ids": ["U1", "U2"]
+  },
+  "created_at": "2026-10-01T20:18:58.255683Z"
+}
+```
+
+相邻快照对照（缺省对照上一条；首条快照无基线时全部计为新增）：
+
+```bash
+curl -s http://localhost:8000/api/snapshots/2/diff
+```
+
+```json
+{
+  "base_snapshot_id": 1,
+  "target_snapshot_id": 2,
+  "base_network_version": 1,
+  "target_network_version": 2,
+  "nodes": {"added": [], "removed": []},
+  "pipes": {"added": [], "removed": []},
+  "valve_positions": {
+    "changed": [{"pipe_id": "P4", "valve_closed_before": false, "valve_closed_after": true}]
+  },
+  "source_states": {"changed": []},
+  "open_faults": {
+    "added": [{"event_id": 1, "fault_pipe_id": "P6"}],
+    "removed": []
+  },
+  "supplied_sinks": {"added": [], "removed": ["U3"]}
+}
+```
+
+整网重新导入后版本重置为 `1`，但快照编号继续递增、旧快照原封不动：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/import \
+  -H 'Content-Type: application/json' -d @examples/sample_network.json
+# {"version":1,...,"snapshot_id":6}   # 编号不是 1，且 1-5 仍可读
+```
+
+错误约定：
+
+- 未知快照编号（读详情或对照）→ `404 SNAPSHOT_NOT_FOUND`；
+- `base_id` 不是目标快照相邻的上一条 → `422 SNAPSHOT_NOT_ADJACENT`；
+- `base_id` ≥ 目标编号 → `422 SNAPSHOT_DIFF_INVALID`。
+
+状态快照回看全流程演示脚本（标准库实现）：
+
+```bash
+python3 examples/snapshot_demo.py
+# 或指定地址：
+python3 examples/snapshot_demo.py http://localhost:8000
+```
+
+脚本依次演示：导入/隔离/复供/水源切换四类操作各自冻结快照 → 按编号读取当时状态 →
+相邻对照六类净变化 → 版本冲突、不可隔离、水源空切换均不留快照 →
+整网重导版本重置但旧快照不覆盖、编号不复用 → 未知编号与非相邻对照报错。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -601,13 +740,13 @@ python3 examples/source_switch_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，40 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，48 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，42 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、版本与安全拒绝、整网替换失效），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，55 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -620,8 +759,8 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估
-  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、历史
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、状态快照冻结与相邻对照
+  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -632,6 +771,7 @@ examples/
   restore_demo.py         # 复供全流程示例
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
+  snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py
   test_api.py

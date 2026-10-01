@@ -72,6 +72,24 @@ BLOCKING_ISSUE_CODES = frozenset(
 )
 
 
+# 快照操作类型
+OP_NETWORK_IMPORT = "network_import"    # 整网导入
+OP_ISOLATION_SUBMIT = "isolation_submit"  # 隔离提交
+OP_RESTORE_CONFIRM = "restore_confirm"  # 复供确认
+OP_SOURCE_SWITCH = "source_switch"      # 水源切换
+OP_BASELINE = "baseline"                # 旧库上线基线（仅当下状态，不伪造历史）
+
+SNAPSHOT_OP_TYPES = frozenset(
+    {
+        OP_NETWORK_IMPORT,
+        OP_ISOLATION_SUBMIT,
+        OP_RESTORE_CONFIRM,
+        OP_SOURCE_SWITCH,
+        OP_BASELINE,
+    }
+)
+
+
 @dataclass(frozen=True)
 class Node:
     id: str
@@ -710,3 +728,162 @@ def evaluate_source_switch(
         blocks=blocks,
         issues=[],
     )
+
+
+# ---------------------------------------------------------------- 状态快照
+
+
+def reachable_sink_ids(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe] | list[Pipe],
+    removed_pipe_ids: frozenset[str] = frozenset(),
+) -> list[str]:
+    """返回由运行中水源可达的用水点编号（按编号排序）。
+
+    快照冻结“供水点”时统一使用该结果：只从 running=True 的水源出发，
+    已关闭阀门与待修复故障管段视为不可通行（由调用方计入 removed_pipe_ids）。
+    """
+    pipe_list = list(pipes.values()) if isinstance(pipes, dict) else list(pipes)
+    reachable = _reachable(nodes, pipe_list, removed_pipe_ids)
+    return sorted(
+        nid for nid, node in nodes.items() if node.type == "sink" and nid in reachable
+    )
+
+
+def freeze_state(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    open_faults: list[tuple[int, str]] | None = None,
+) -> dict:
+    """把当前领域状态冻结为不可变（JSON 可序列化）的快照载荷。
+
+    open_faults：(事件编号, 故障管段编号) 列表，即全部待修复(open)故障，
+    按事件编号排序；快照据此记录“当时待修复故障”，不引用后续事件回填。
+
+    载荷中的 supplied_sink_ids 为“由运行水源可达的用水点”，计算时排除
+    已关闭阀门与待修复故障管段，与隔离/复供/切换的通水口径完全一致。
+    """
+    frozen_nodes = [
+        {
+            "id": node.id,
+            "type": node.type,
+            "name": node.name,
+            "running": node.running,
+        }
+        for node in (nodes[nid] for nid in sorted(nodes))
+    ]
+    frozen_pipes = [
+        {
+            "id": pipe.id,
+            "from": pipe.from_node,
+            "to": pipe.to_node,
+            "has_valve": pipe.has_valve,
+            "valve_closed": pipe.valve_closed,
+            "name": pipe.name,
+        }
+        for pipe in (pipes[pid] for pid in sorted(pipes))
+    ]
+    blocked = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | frozenset(fault_pid for _eid, fault_pid in (open_faults or []))
+    frozen_faults = [
+        {"event_id": event_id, "fault_pipe_id": fault_pipe_id}
+        for event_id, fault_pipe_id in sorted(open_faults or [])
+    ]
+    return {
+        "nodes": frozen_nodes,
+        "pipes": frozen_pipes,
+        "open_faults": frozen_faults,
+        "supplied_sink_ids": reachable_sink_ids(nodes, list(pipes.values()), blocked),
+    }
+
+
+def _node_index(state: dict) -> dict[str, dict]:
+    return {n["id"]: n for n in state.get("nodes", [])}
+
+
+def _pipe_index(state: dict) -> dict[str, dict]:
+    return {p["id"]: p for p in state.get("pipes", [])}
+
+
+def _fault_index(state: dict) -> dict[int, dict]:
+    return {f["event_id"]: f for f in state.get("open_faults", [])}
+
+
+def diff_states(base: dict | None, target: dict) -> dict:
+    """对照两份冻结状态，返回六类净变化。
+
+    - nodes：节点新增/移除（整网导入为替换式，通常整批增删）；
+    - pipes：管段新增/移除；
+    - valve_positions：共有管段中阀门位置（开/关）变化；
+    - source_states：共有水源节点运行(running)状态变化；
+    - open_faults：待修复故障（按事件编号）新增/移除；
+    - supplied_sinks：由运行水源可达用水点集合的新增/移除（净变化）。
+
+    base 为 None（首条快照没有更早基线）时，目标状态全部计为新增。
+    历史结果只取自两份冻结载荷，不读取当前管网或后续事件。
+    """
+    base = base or {}
+
+    base_nodes, target_nodes = _node_index(base), _node_index(target)
+    base_pipes, target_pipes = _pipe_index(base), _pipe_index(target)
+    base_faults, target_faults = _fault_index(base), _fault_index(target)
+
+    node_added = [target_nodes[nid] for nid in sorted(target_nodes.keys() - base_nodes.keys())]
+    node_removed = [base_nodes[nid] for nid in sorted(base_nodes.keys() - target_nodes.keys())]
+
+    pipe_added = [target_pipes[pid] for pid in sorted(target_pipes.keys() - base_pipes.keys())]
+    pipe_removed = [base_pipes[pid] for pid in sorted(base_pipes.keys() - target_pipes.keys())]
+
+    valve_changes: list[dict] = []
+    for pid in sorted(base_pipes.keys() & target_pipes.keys()):
+        before_p, after_p = base_pipes[pid], target_pipes[pid]
+        if (
+            before_p.get("has_valve")
+            and after_p.get("has_valve")
+            and bool(before_p.get("valve_closed")) != bool(after_p.get("valve_closed"))
+        ):
+            valve_changes.append(
+                {
+                    "pipe_id": pid,
+                    "valve_closed_before": bool(before_p.get("valve_closed")),
+                    "valve_closed_after": bool(after_p.get("valve_closed")),
+                }
+            )
+
+    source_changes: list[dict] = []
+    for nid in sorted(base_nodes.keys() & target_nodes.keys()):
+        before_n, after_n = base_nodes[nid], target_nodes[nid]
+        if (
+            before_n.get("type") == "source"
+            and after_n.get("type") == "source"
+            and bool(before_n.get("running")) != bool(after_n.get("running"))
+        ):
+            source_changes.append(
+                {
+                    "source_id": nid,
+                    "running_before": bool(before_n.get("running")),
+                    "running_after": bool(after_n.get("running")),
+                }
+            )
+
+    fault_added = [
+        target_faults[eid] for eid in sorted(target_faults.keys() - base_faults.keys())
+    ]
+    fault_removed = [
+        base_faults[eid] for eid in sorted(base_faults.keys() - target_faults.keys())
+    ]
+
+    base_sinks = set(base.get("supplied_sink_ids", []))
+    target_sinks = set(target.get("supplied_sink_ids", []))
+    sink_added = sorted(target_sinks - base_sinks)
+    sink_removed = sorted(base_sinks - target_sinks)
+
+    return {
+        "nodes": {"added": node_added, "removed": node_removed},
+        "pipes": {"added": pipe_added, "removed": pipe_removed},
+        "valve_positions": {"changed": valve_changes},
+        "source_states": {"changed": source_changes},
+        "open_faults": {"added": fault_added, "removed": fault_removed},
+        "supplied_sinks": {"added": sink_added, "removed": sink_removed},
+    }

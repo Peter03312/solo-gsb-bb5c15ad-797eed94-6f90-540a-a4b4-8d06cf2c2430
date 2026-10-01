@@ -1,4 +1,4 @@
-"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交。"""
+"""PostgreSQL 访问层：建表、当前快照读取、整网导入、隔离提交、复供、水源切换、状态回看快照。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,17 @@ import psycopg2.extras
 from psycopg2.errors import UndefinedTable
 
 from .config import get_settings
-from .planning import Node, Pipe, PlanResult
+from .planning import (
+    Node,
+    Pipe,
+    PlanResult,
+    OP_BASELINE,
+    OP_ISOLATION_SUBMIT,
+    OP_NETWORK_IMPORT,
+    OP_RESTORE_CONFIRM,
+    OP_SOURCE_SWITCH,
+    freeze_state,
+)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS network_meta (
@@ -78,6 +88,23 @@ BEGIN
             CHECK (status IN ('open', 'restored'));
     END IF;
 END$$;
+
+-- 状态回看快照：只增不改、编号全局单调、永不复用。
+-- 整网导入不截断本表，因此即使版本重置为 1，此前快照依然保留可读。
+-- event_id 不加外键：整网导入会清空隔离事件，但历史快照仍须自包含可读。
+CREATE TABLE IF NOT EXISTS state_snapshots (
+    id           BIGSERIAL PRIMARY KEY,
+    op_type      TEXT NOT NULL CHECK (op_type IN
+                    ('network_import', 'isolation_submit',
+                     'restore_confirm', 'source_switch', 'baseline')),
+    network_version INTEGER NOT NULL,
+    event_id     BIGINT,
+    state        JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_version
+    ON state_snapshots (network_version);
 """
 
 # 事件状态：待修复 / 已复供
@@ -108,7 +135,12 @@ def transaction() -> Iterator:
 
 
 def init_db() -> None:
-    """启动时建表；等待 PostgreSQL 就绪。"""
+    """启动时建表；等待 PostgreSQL 就绪。
+
+    旧库上线（已存在管网数据但从无快照）时，仅以**当下状态**建立一条
+    baseline 基线快照；绝不按既有事件伪造早期快照。空库与已有快照的库
+    不产生基线。
+    """
     settings = get_settings()
     last_error: Exception | None = None
     for attempt in range(1, settings.db_connect_retries + 1):
@@ -116,12 +148,35 @@ def init_db() -> None:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(DDL)
+                _ensure_baseline_if_legacy(conn)
                 conn.commit()
             return
         except (psycopg2.OperationalError, UndefinedTable) as exc:  # pragma: no cover
             last_error = exc
             time.sleep(settings.db_connect_retry_interval)
     raise RuntimeError(f"数据库初始化失败：{last_error}")
+
+
+def _ensure_baseline_if_legacy(conn) -> None:
+    """旧库上线基线：快照表为空且当前存在管网时，冻结当下状态为 baseline。
+
+    必须在建表 DDL 之后、同一事务内执行；不修改管网版本与任何业务状态。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM state_snapshots")
+        if cur.fetchone()[0] > 0:
+            return
+        cur.execute("SELECT count(*) FROM nodes")
+        if cur.fetchone()[0] == 0:
+            return
+    version, _updated_at, nodes, pipes = load_snapshot(conn)
+    open_faults = [(e["id"], e["fault_pipe_id"]) for e in list_open_events(conn)]
+    insert_state_snapshot(
+        conn,
+        op_type=OP_BASELINE,
+        network_version=version,
+        state=freeze_state(nodes, pipes, open_faults),
+    )
 
 
 # ---------------------------------------------------------------- 快照
@@ -167,20 +222,23 @@ def load_snapshot(conn, *, for_update: bool = False) -> tuple[int, datetime | No
 # ---------------------------------------------------------------- 整网导入
 
 
-def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
+def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> tuple[int, int]:
     """在已开启的事务中整网替换：清空旧数据并重写，版本重置为 1。
 
-    返回新版本号。导入是对管网的整体重新定义，因此版本从头计数；
-    历史事件也随整网替换一并清空，避免引用旧编号。
+    返回 (新版本号, 快照编号)。导入是对管网的整体重新定义，因此版本从头
+    计数；历史事件也随整网替换一并清空，避免引用旧编号。
+
+    状态快照表（state_snapshots）**不**清空：编号不可复用，导入后版本
+    虽重置为 1，此前快照依旧保留；本次导入在同一事务内另冻结一条新快照。
     """
     with conn.cursor() as cur:
         cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
         if cur.fetchone() is None:
             cur.execute("INSERT INTO network_meta (id, version) VALUES (1, 0)")
 
-        cur.execute("TRUNCATE isolation_events")
-        cur.execute("TRUNCATE pipes")
-        cur.execute("TRUNCATE nodes")
+        # 外键 pipes -> nodes：必须在同一条 TRUNCATE 中清空（CASCADE 仅作用于
+        # 业务表）；state_snapshots 刻意不在清空列表内，历史快照永不被导入覆盖。
+        cur.execute("TRUNCATE isolation_events, pipes, nodes")
 
         cur.executemany(
             "INSERT INTO nodes (id, type, name, running) "
@@ -198,7 +256,17 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
         cur.execute(
             "UPDATE network_meta SET version = 1, updated_at = now() WHERE id = 1"
         )
-    return 1
+
+    # 同一事务内冻结“操作后”快照：版本 1、无历史事件、无待修复故障
+    node_map = {n.id: n for n in nodes}
+    pipe_map = {p.id: p for p in pipes}
+    snapshot_id = insert_state_snapshot(
+        conn,
+        op_type=OP_NETWORK_IMPORT,
+        network_version=1,
+        state=freeze_state(node_map, pipe_map, []),
+    )
+    return 1, snapshot_id
 
 
 # ---------------------------------------------------------------- 隔离提交
@@ -251,10 +319,22 @@ def submit_isolation(
         )
         event_id, created_at = cur.fetchone()
 
+    # 同一事务内冻结“操作后”快照：新阀位 + 全部待修复故障（含本事件）
+    _post_version, _updated_at, post_nodes, post_pipes = load_snapshot(conn)
+    open_faults = [(e["id"], e["fault_pipe_id"]) for e in list_open_events(conn)]
+    snapshot_id = insert_state_snapshot(
+        conn,
+        op_type=OP_ISOLATION_SUBMIT,
+        network_version=new_version,
+        event_id=event_id,
+        state=freeze_state(post_nodes, post_pipes, open_faults),
+    )
+
     return {
         "version": new_version,
         "event_id": event_id,
         "created_at": created_at,
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -302,7 +382,17 @@ def switch_sources(
             (new_version,),
         )
 
-    return {"version": new_version}
+    # 同一事务内冻结“操作后”快照：新水源运行状态、阀位/故障不变
+    _post_version, _updated_at, post_nodes, post_pipes = load_snapshot(conn)
+    open_faults = [(e["id"], e["fault_pipe_id"]) for e in list_open_events(conn)]
+    snapshot_id = insert_state_snapshot(
+        conn,
+        op_type=OP_SOURCE_SWITCH,
+        network_version=new_version,
+        state=freeze_state(post_nodes, post_pipes, open_faults),
+    )
+
+    return {"version": new_version, "snapshot_id": snapshot_id}
 
 
 # ---------------------------------------------------------------- 复供
@@ -402,9 +492,21 @@ def confirm_restore(
         cur.execute("SELECT restored_at FROM isolation_events WHERE id = %s", (event_id,))
         restored_at = cur.fetchone()[0]
 
+    # 同一事务内冻结“操作后”快照：阀门已重开、本事件不再计入待修复故障
+    _post_version, _updated_at, post_nodes, post_pipes = load_snapshot(conn)
+    open_faults = [(e["id"], e["fault_pipe_id"]) for e in list_open_events(conn)]
+    snapshot_id = insert_state_snapshot(
+        conn,
+        op_type=OP_RESTORE_CONFIRM,
+        network_version=new_version,
+        event_id=event_id,
+        state=freeze_state(post_nodes, post_pipes, open_faults),
+    )
+
     return {
         "version": new_version,
         "restored_at": restored_at,
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -420,3 +522,85 @@ def list_events(conn, limit: int) -> list[dict]:
         )
         rows = cur.fetchall()
     return [_serialize_event_row(r) for r in rows]
+
+
+# ---------------------------------------------------------------- 状态快照
+
+
+_SNAPSHOT_COLUMNS = "id, op_type, network_version, event_id, state, created_at"
+
+
+def _serialize_snapshot_row(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "op_type": row["op_type"],
+        "network_version": row["network_version"],
+        "event_id": row["event_id"],
+        "state": _decode_jsonb(row["state"]),
+        "created_at": row["created_at"],
+    }
+
+
+def insert_state_snapshot(
+    conn,
+    *,
+    op_type: str,
+    network_version: int,
+    state: dict,
+    event_id: int | None = None,
+) -> int:
+    """在调用方事务内冻结一条状态快照，返回不可复用的快照编号。
+
+    仅插入、不更新、不删除；快照编号由 BIGSERIAL 全局单调分配，整网导入
+    也不重置该序列。必须在状态实际变更后、同一事务内调用。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO state_snapshots (op_type, network_version, event_id, state) "
+            "VALUES (%s, %s, %s, %s::jsonb) RETURNING id",
+            (op_type, network_version, event_id, json.dumps(state)),
+        )
+        return cur.fetchone()[0]
+
+
+def get_state_snapshot(conn, snapshot_id: int) -> dict | None:
+    """按编号读取冻结快照；不存在返回 None（路由层据此报 SNAPSHOT_NOT_FOUND）。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots WHERE id = %s",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    return _serialize_snapshot_row(row) if row else None
+
+
+def list_state_snapshots(
+    conn, *, limit: int, after_id: int | None = None
+) -> list[dict]:
+    """按编号升序列出快照元数据（含冻结状态）。
+
+    after_id 为游标：只返回编号严格大于它的快照；不传时从头返回。
+    """
+    sql = f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots"
+    params: list = []
+    if after_id is not None:
+        sql += " WHERE id > %s"
+        params.append(after_id)
+    sql += " ORDER BY id ASC LIMIT %s"
+    params.append(limit)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [_serialize_snapshot_row(r) for r in rows]
+
+
+def get_previous_state_snapshot(conn, snapshot_id: int) -> dict | None:
+    """读取编号严格小于 snapshot_id 的最近一条快照；为首条快照时返回 None。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots "
+            "WHERE id < %s ORDER BY id DESC LIMIT 1",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    return _serialize_snapshot_row(row) if row else None

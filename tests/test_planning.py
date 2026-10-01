@@ -11,9 +11,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.planning import (  # noqa: E402
     Node,
     Pipe,
+    diff_states,
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
+    freeze_state,
+    reachable_sink_ids,
     recommend_plan,
     validate_import,
     DUPLICATE_NODE_ID,
@@ -578,6 +581,120 @@ class SourceSwitchPlanningTests(unittest.TestCase):
         plan = evaluate_plan(nodes, pipes, "Q2", [])
         self.assertTrue(plan.isolatable)
         self.assertEqual(plan.affected_sink_ids, [])
+
+
+class SnapshotStateTests(unittest.TestCase):
+    def test_reachable_sink_ids_only_running_sources(self):
+        nodes, pipes = build_demo()
+        self.assertEqual(reachable_sink_ids(nodes, pipes), ["U1", "U2", "U3"])
+        # 关闭 P4 与故障 P6 阻断后 U3 不在供水点
+        blocked = frozenset({"P4", "P6"})
+        self.assertEqual(reachable_sink_ids(nodes, pipes, blocked), ["U1", "U2"])
+
+    def test_reachable_sink_ids_empty_when_all_sources_stopped(self):
+        nodes, pipes = build_two_source_demo()
+        nodes["S1"] = Node("S1", "source", running=False)
+        nodes["S2"] = Node("S2", "source", running=False)
+        self.assertEqual(reachable_sink_ids(nodes, pipes), [])
+
+    def test_freeze_state_contains_all_parts(self):
+        nodes, pipes = build_demo()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        state = freeze_state(nodes, pipes, [(7, "P6")])
+        self.assertEqual([n["id"] for n in state["nodes"]],
+                         ["A", "B", "D", "S", "U1", "U2", "U3"])
+        self.assertEqual([p["id"] for p in state["pipes"]],
+                         ["P1", "P2", "P3", "P4", "P5", "P6"])
+        p4 = next(p for p in state["pipes"] if p["id"] == "P4")
+        self.assertTrue(p4["valve_closed"])
+        self.assertEqual(
+            state["open_faults"], [{"event_id": 7, "fault_pipe_id": "P6"}]
+        )
+        # P4 关、P6 故障：U3 不供水
+        self.assertEqual(state["supplied_sink_ids"], ["U1", "U2"])
+
+    def test_diff_none_base_treats_all_added(self):
+        nodes, pipes = build_demo()
+        target = freeze_state(nodes, pipes)
+        diff = diff_states(None, target)
+        self.assertEqual(len(diff["nodes"]["added"]), 7)
+        self.assertEqual(diff["nodes"]["removed"], [])
+        self.assertEqual(len(diff["pipes"]["added"]), 6)
+        self.assertEqual(
+            diff["supplied_sinks"]["added"], ["U1", "U2", "U3"]
+        )
+        self.assertEqual(diff["supplied_sinks"]["removed"], [])
+        self.assertEqual(diff["valve_positions"]["changed"], [])
+        self.assertEqual(diff["source_states"]["changed"], [])
+        self.assertEqual(diff["open_faults"]["added"], [])
+        self.assertEqual(diff["open_faults"]["removed"], [])
+
+    def test_diff_valve_fault_and_sink_changes(self):
+        nodes, pipes = build_demo()
+        before = freeze_state(nodes, pipes, [])
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        after = freeze_state(nodes, pipes, [(1, "P6")])
+        diff = diff_states(before, after)
+        self.assertEqual(diff["nodes"]["added"], [])
+        self.assertEqual(diff["pipes"]["added"], [])
+        self.assertEqual(
+            diff["valve_positions"]["changed"],
+            [{"pipe_id": "P4", "valve_closed_before": False,
+              "valve_closed_after": True}],
+        )
+        self.assertEqual(
+            diff["open_faults"]["added"],
+            [{"event_id": 1, "fault_pipe_id": "P6"}],
+        )
+        self.assertEqual(diff["open_faults"]["removed"], [])
+        self.assertEqual(diff["supplied_sinks"]["added"], [])
+        self.assertEqual(diff["supplied_sinks"]["removed"], ["U3"])
+
+    def test_diff_source_state_changes(self):
+        nodes, pipes = build_two_source_demo()
+        before = freeze_state(nodes, pipes, [])
+        nodes["S1"] = Node("S1", "source", running=False)
+        after = freeze_state(nodes, pipes, [])
+        diff = diff_states(before, after)
+        self.assertEqual(
+            diff["source_states"]["changed"],
+            [{"source_id": "S1", "running_before": True,
+              "running_after": False}],
+        )
+        # S2 仍经 C 顶供：用水点无净变化
+        self.assertEqual(diff["supplied_sinks"]["added"], [])
+        self.assertEqual(diff["supplied_sinks"]["removed"], [])
+
+    def test_diff_network_replacement(self):
+        nodes, pipes = build_demo()
+        before = freeze_state(nodes, pipes, [])
+        nodes2, pipes2 = build_two_source_demo()
+        after = freeze_state(nodes2, pipes2, [])
+        diff = diff_states(before, after)
+        self.assertEqual(
+            {n["id"] for n in diff["nodes"]["added"]}, {"S1", "S2", "C"}
+        )
+        self.assertEqual(
+            {n["id"] for n in diff["nodes"]["removed"]},
+            {"S", "A", "B", "D", "U3"},
+        )
+        self.assertEqual(
+            {p["id"] for p in diff["pipes"]["added"]}, {"Q1", "Q2", "Q3", "Q4"}
+        )
+        self.assertEqual(
+            {p["id"] for p in diff["pipes"]["removed"]},
+            {"P1", "P2", "P3", "P4", "P5", "P6"},
+        )
+
+    def test_diff_is_symmetric_for_no_change(self):
+        nodes, pipes = build_demo()
+        state = freeze_state(nodes, pipes, [(1, "P1")])
+        diff = diff_states(state, state)
+        for section in ("nodes", "pipes", "open_faults", "supplied_sinks"):
+            self.assertEqual(diff[section]["added"], [])
+            self.assertEqual(diff[section]["removed"], [])
+        self.assertEqual(diff["valve_positions"]["changed"], [])
+        self.assertEqual(diff["source_states"]["changed"], [])
 
 
 if __name__ == "__main__":
