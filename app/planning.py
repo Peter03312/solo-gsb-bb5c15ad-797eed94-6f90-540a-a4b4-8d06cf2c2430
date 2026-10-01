@@ -710,3 +710,158 @@ def evaluate_source_switch(
         blocks=blocks,
         issues=[],
     )
+
+
+# ------------------------------------------------------------ 状态快照
+
+
+def supplied_sink_ids(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    *,
+    pending_fault_pipe_ids: frozenset[str] = frozenset(),
+) -> list[str]:
+    """返回当前由“运行中”水源可达的用水点编号（按字典序）。
+
+    已关闭阀门与待修复故障管段视为不可通行；停运水源不作为供水起点。
+    状态快照在写事务内调用本函数，把结果一并冻结，事后回看不得用当前管网重算。
+    """
+    pipe_list = list(pipes.values())
+    removed = frozenset(
+        p.id for p in pipe_list if p.has_valve and p.valve_closed
+    ) | frozenset(pid for pid in pending_fault_pipe_ids if pid in pipes)
+    reachable = _reachable(nodes, pipe_list, removed)
+    return sorted(
+        nid for nid, node in nodes.items()
+        if node.type == "sink" and nid in reachable
+    )
+
+
+def _snapshot_node_map(snapshot: dict) -> dict[str, dict]:
+    return {n["id"]: n for n in snapshot["nodes"]}
+
+
+def _snapshot_pipe_map(snapshot: dict) -> dict[str, dict]:
+    return {p["id"]: p for p in snapshot["pipes"]}
+
+
+def _snapshot_fault_map(snapshot: dict) -> dict[int, dict]:
+    return {f["event_id"]: f for f in snapshot["open_faults"]}
+
+
+_PIPE_STRUCT_KEYS = ("from", "to", "has_valve", "name")
+
+
+def diff_state_snapshots(before: dict, after: dict) -> dict:
+    """两份已冻结快照之间的净变化对照（纯函数，不读当前管网/后续事件）。
+
+    入参为快照冻结载荷：节点 {id,type,name,running}、
+    管段 {id,from,to,has_valve,valve_closed,name}、
+    待修复故障 {event_id,fault_pipe_id,closed_pipe_ids}、
+    supplied_sink_ids。输出六类净变化：节点、管段、阀位、水源运行状态、
+    待修复故障、供水点；各列表均按编号确定序排序。
+    """
+    before_nodes = _snapshot_node_map(before)
+    after_nodes = _snapshot_node_map(after)
+    before_pipes = _snapshot_pipe_map(before)
+    after_pipes = _snapshot_pipe_map(after)
+
+    before_node_ids = set(before_nodes)
+    after_node_ids = set(after_nodes)
+
+    nodes_added = [after_nodes[nid] for nid in sorted(after_node_ids - before_node_ids)]
+    nodes_removed = [
+        before_nodes[nid] for nid in sorted(before_node_ids - after_node_ids)
+    ]
+    nodes_changed: list[dict] = []
+    source_states: list[dict] = []
+    for nid in sorted(before_node_ids & after_node_ids):
+        bn = before_nodes[nid]
+        an = after_nodes[nid]
+        if bn.get("type") != an.get("type") or bn.get("name") != an.get("name"):
+            nodes_changed.append(
+                {
+                    "id": nid,
+                    "before": {"type": bn.get("type"), "name": bn.get("name")},
+                    "after": {"type": an.get("type"), "name": an.get("name")},
+                }
+            )
+        # 水源运行状态单列一类；仅对照两侧同为水源的节点
+        if (
+            bn.get("type") == "source"
+            and an.get("type") == "source"
+            and bn.get("running") != an.get("running")
+        ):
+            source_states.append(
+                {
+                    "id": nid,
+                    "running_before": bn.get("running"),
+                    "running_after": an.get("running"),
+                }
+            )
+
+    before_pipe_ids = set(before_pipes)
+    after_pipe_ids = set(after_pipes)
+    pipes_added = [after_pipes[pid] for pid in sorted(after_pipe_ids - before_pipe_ids)]
+    pipes_removed = [
+        before_pipes[pid] for pid in sorted(before_pipe_ids - after_pipe_ids)
+    ]
+    pipes_changed: list[dict] = []
+    valves_closed: list[str] = []
+    valves_reopened: list[str] = []
+    for pid in sorted(before_pipe_ids & after_pipe_ids):
+        bp = before_pipes[pid]
+        ap = after_pipes[pid]
+        if any(bp.get(k) != ap.get(k) for k in _PIPE_STRUCT_KEYS):
+            pipes_changed.append({"id": pid, "before": bp, "after": ap})
+        # 阀位净变化：只管两侧都带阀门且编号仍在的管段；
+        # 整网导入删除的管段其阀位变化计入管段 removed，不在此重复。
+        if bp.get("has_valve") and ap.get("has_valve"):
+            if not bp.get("valve_closed") and ap.get("valve_closed"):
+                valves_closed.append(pid)
+            elif bp.get("valve_closed") and not ap.get("valve_closed"):
+                valves_reopened.append(pid)
+
+    before_faults = _snapshot_fault_map(before)
+    after_faults = _snapshot_fault_map(after)
+    faults_added = [
+        after_faults[eid]
+        for eid in sorted(set(after_faults) - set(before_faults))
+    ]
+    faults_resolved = [
+        before_faults[eid]
+        for eid in sorted(set(before_faults) - set(after_faults))
+    ]
+
+    before_sinks = set(before["supplied_sink_ids"])
+    after_sinks = set(after["supplied_sink_ids"])
+
+    return {
+        "base_snapshot_id": before["id"],
+        "target_snapshot_id": after["id"],
+        "base_version": before["version"],
+        "target_version": after["version"],
+        "nodes": {
+            "added": nodes_added,
+            "removed": nodes_removed,
+            "changed": nodes_changed,
+        },
+        "source_states": source_states,
+        "pipes": {
+            "added": pipes_added,
+            "removed": pipes_removed,
+            "changed": pipes_changed,
+        },
+        "valve_positions": {
+            "closed": valves_closed,
+            "reopened": valves_reopened,
+        },
+        "open_faults": {
+            "added": faults_added,
+            "resolved": faults_resolved,
+        },
+        "supplied_sinks": {
+            "newly_supplied": sorted(after_sinks - before_sinks),
+            "newly_lost": sorted(before_sinks - after_sinks),
+        },
+    }

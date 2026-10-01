@@ -1,4 +1,4 @@
-"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交。"""
+"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交、状态快照。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ import psycopg2.extras
 from psycopg2.errors import UndefinedTable
 
 from .config import get_settings
-from .planning import Node, Pipe, PlanResult
+from .planning import Node, Pipe, PlanResult, supplied_sink_ids
 
 DDL = """
 CREATE TABLE IF NOT EXISTS network_meta (
@@ -78,7 +78,37 @@ BEGIN
             CHECK (status IN ('open', 'restored'));
     END IF;
 END$$;
+
+-- 操作后状态快照：只追加、不更新、不随整网导入清空。
+-- 快照编号 BIGSERIAL，事务回滚也不回收，保证“不可复用”。
+CREATE TABLE IF NOT EXISTS state_snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    operation_type  TEXT NOT NULL
+                    CHECK (operation_type IN
+                           ('import', 'isolation_submit', 'restore', 'source_switch',
+                            'baseline')),
+    version         INTEGER NOT NULL,
+    event_id        BIGINT,
+    nodes_snapshot  JSONB NOT NULL,
+    pipes_snapshot  JSONB NOT NULL,
+    open_faults     JSONB NOT NULL,
+    supplied_sinks  JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_version
+    ON state_snapshots (version);
 """
+
+# 快照操作类型
+SNAPSHOT_IMPORT = "import"
+SNAPSHOT_ISOLATION_SUBMIT = "isolation_submit"
+SNAPSHOT_RESTORE = "restore"
+SNAPSHOT_SOURCE_SWITCH = "source_switch"
+SNAPSHOT_BASELINE = "baseline"
+
+# 旧库上线建基线时使用的会话级咨询锁（任意固定的 int8 键）
+_BASELINE_LOCK_KEY = 71003001
 
 # 事件状态：待修复 / 已复供
 EVENT_OPEN = "open"
@@ -108,7 +138,11 @@ def transaction() -> Iterator:
 
 
 def init_db() -> None:
-    """启动时建表；等待 PostgreSQL 就绪。"""
+    """启动时建表；等待 PostgreSQL 就绪。
+
+    旧库上线：表结构升级后若快照表为空且库中已有管网数据，仅以当下状态
+    建立一条 baseline 基线快照，不按现存事件/版本伪造早期操作记录。
+    """
     settings = get_settings()
     last_error: Exception | None = None
     for attempt in range(1, settings.db_connect_retries + 1):
@@ -117,11 +151,31 @@ def init_db() -> None:
                 with conn.cursor() as cur:
                     cur.execute(DDL)
                 conn.commit()
+            ensure_baseline_snapshot()
             return
         except (psycopg2.OperationalError, UndefinedTable) as exc:  # pragma: no cover
             last_error = exc
             time.sleep(settings.db_connect_retry_interval)
     raise RuntimeError(f"数据库初始化失败：{last_error}")
+
+
+def ensure_baseline_snapshot() -> int | None:
+    """旧库上线：快照表为空且已有管网数据时，冻结一条当下状态的 baseline。
+
+    全新部署（空网，版本 0）不建基线；首次整网导入会生成 import 快照。
+    返回基线快照编号；无需建立时返回 None。
+    """
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            # 防止多实例并发启动时重复建立基线
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BASELINE_LOCK_KEY,))
+            cur.execute("SELECT 1 FROM state_snapshots LIMIT 1")
+            if cur.fetchone() is not None:
+                return None
+            cur.execute("SELECT 1 FROM nodes LIMIT 1")
+            if cur.fetchone() is None:
+                return None  # 空网：不伪造任何记录
+        return freeze_state_snapshot(conn, SNAPSHOT_BASELINE)
 
 
 # ---------------------------------------------------------------- 快照
@@ -162,6 +216,174 @@ def load_snapshot(conn, *, for_update: bool = False) -> tuple[int, datetime | No
             for r in cur.fetchall()
         }
     return version, updated_at, nodes, pipes
+
+
+# ---------------------------------------------------- 操作后状态快照冻结
+
+
+def _open_fault_payloads(conn) -> list[dict]:
+    """读取全部待修复(open)事件的冻结字段，按事件编号升序。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, fault_pipe_id, closed_pipe_ids FROM isolation_events "
+            "WHERE status = %s ORDER BY id",
+            (EVENT_OPEN,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "event_id": r["id"],
+            "fault_pipe_id": r["fault_pipe_id"],
+            "closed_pipe_ids": _decode_jsonb(r["closed_pipe_ids"]),
+        }
+        for r in rows
+    ]
+
+
+def _nodes_payload(nodes: dict[str, Node]) -> list[dict]:
+    return [
+        {
+            "id": node.id,
+            "type": node.type,
+            "name": node.name,
+            "running": node.running if node.type == "source" else True,
+        }
+        for node in sorted(nodes.values(), key=lambda n: n.id)
+    ]
+
+
+def _pipes_payload(pipes: dict[str, Pipe]) -> list[dict]:
+    return [
+        {
+            "id": pipe.id,
+            "from": pipe.from_node,
+            "to": pipe.to_node,
+            "has_valve": pipe.has_valve,
+            # 冻结实际阀位：无阀管段恒为开启态（序列化为 null）
+            "valve_closed": pipe.valve_closed if pipe.has_valve else None,
+            "name": pipe.name,
+        }
+        for pipe in sorted(pipes.values(), key=lambda p: p.id)
+    ]
+
+
+def freeze_state_snapshot(
+    conn,
+    operation_type: str,
+    *,
+    event_id: int | None = None,
+) -> int:
+    """在调用方已开启的写事务内，冻结“操作后”的完整状态并写入快照表。
+
+    必须在状态变更（导入/关阀/重开/水源切换）之后、同一事务内调用：
+    重新读取的版本、节点、管段与待修复事件即为操作后状态；由运行水源
+    可达的用水点也在此时算好一并冻结，历史回看不再用当前管网重算。
+    返回新快照编号（BIGSERIAL，事务回滚编号也不复用）。
+    """
+    version, _updated_at, nodes, pipes = load_snapshot(conn)
+    open_faults = _open_fault_payloads(conn)
+    pending_fault_pipe_ids = frozenset(f["fault_pipe_id"] for f in open_faults)
+    supplied = supplied_sink_ids(
+        nodes, pipes, pending_fault_pipe_ids=pending_fault_pipe_ids
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO state_snapshots "
+            "(operation_type, version, event_id, nodes_snapshot, pipes_snapshot, "
+            " open_faults, supplied_sinks) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb) "
+            "RETURNING id",
+            (
+                operation_type,
+                version,
+                event_id,
+                json.dumps(_nodes_payload(nodes), ensure_ascii=False),
+                json.dumps(_pipes_payload(pipes), ensure_ascii=False),
+                json.dumps(open_faults, ensure_ascii=False),
+                json.dumps(supplied, ensure_ascii=False),
+            ),
+        )
+        snapshot_id = cur.fetchone()[0]
+    return snapshot_id
+
+
+# ---------------------------------------------------- 状态快照读取
+
+
+def _snapshot_row_to_dict(r: dict) -> dict:
+    """快照行 -> 冻结载荷（含快照元数据；diff 比对直接消费该结构）。"""
+    return {
+        "id": r["id"],
+        "operation_type": r["operation_type"],
+        "version": r["version"],
+        "event_id": r.get("event_id"),
+        "created_at": r["created_at"],
+        "nodes": _decode_jsonb(r["nodes_snapshot"]),
+        "pipes": _decode_jsonb(r["pipes_snapshot"]),
+        "open_faults": _decode_jsonb(r["open_faults"]),
+        "supplied_sink_ids": _decode_jsonb(r["supplied_sinks"]),
+    }
+
+
+_SNAPSHOT_COLUMNS = (
+    "id, operation_type, version, event_id, nodes_snapshot, pipes_snapshot, "
+    "open_faults, supplied_sinks, created_at"
+)
+
+
+def get_state_snapshot(conn, snapshot_id: int) -> dict | None:
+    """按编号读取冻结快照；不存在返回 None（路由层据此报 SNAPSHOT_NOT_FOUND）。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots WHERE id = %s",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    return _snapshot_row_to_dict(row) if row else None
+
+
+def get_previous_state_snapshot(conn, snapshot_id: int) -> dict | None:
+    """读取编号严格小于 snapshot_id 的最近一条快照（按操作顺序的前一条）。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots "
+            "WHERE id < %s ORDER BY id DESC LIMIT 1",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    return _snapshot_row_to_dict(row) if row else None
+
+
+def list_state_snapshots(
+    conn, limit: int, after_id: int = 0
+) -> list[dict]:
+    """按编号升序（操作顺序）列出快照元数据，after_id 为游标分页。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, operation_type, version, event_id, created_at, "
+            "       jsonb_array_length(nodes_snapshot) AS node_count, "
+            "       jsonb_array_length(pipes_snapshot) AS pipe_count, "
+            "       jsonb_array_length(open_faults) AS open_fault_count, "
+            "       jsonb_array_length(supplied_sinks) AS supplied_sink_count "
+            "FROM state_snapshots WHERE id > %s ORDER BY id ASC LIMIT %s",
+            (after_id, limit),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": r["id"],
+            "operation_type": r["operation_type"],
+            "version": r["version"],
+            "event_id": r["event_id"],
+            "created_at": r["created_at"],
+            "node_count": r["node_count"],
+            "pipe_count": r["pipe_count"],
+            "open_fault_count": r["open_fault_count"],
+            "supplied_sink_count": r["supplied_sink_count"],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------- 整网导入

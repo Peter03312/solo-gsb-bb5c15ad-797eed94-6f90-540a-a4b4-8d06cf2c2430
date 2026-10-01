@@ -17,7 +17,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.planning import Node, Pipe  # noqa: E402
+from app.planning import Node, Pipe, supplied_sink_ids  # noqa: E402
+import datetime  # noqa: E402
+
+SNAPSHOT_TIME = datetime.datetime(2026, 10, 1, 8, 0, 0)
 
 
 class FakeStore:
@@ -29,6 +32,9 @@ class FakeStore:
         self.events = []
         self.next_event_id = 1
         self.fail_commit = False
+        # 状态快照：只追加；整网导入不清理（快照编号永不复用）
+        self.snapshots = []
+        self.next_snapshot_id = 1
 
 
 STORE = FakeStore()
@@ -54,6 +60,8 @@ def fake_transaction():
         "pipes": dict(STORE.pipes),
         "events": list(STORE.events),
         "next_id": STORE.next_event_id,
+        "snapshots": list(STORE.snapshots),
+        "next_snapshot_id": STORE.next_snapshot_id,
     }
     try:
         yield conn
@@ -64,7 +72,8 @@ def fake_transaction():
         STORE.nodes = tmp["nodes"]
         STORE.pipes = tmp["pipes"]
         STORE.events = tmp["events"]
-        STORE.next_event_id = tmp["next_id"]
+        STORE.snapshots = tmp["snapshots"]
+        # 事件/快照编号模拟 PostgreSQL SEQUENCE：事务回滚也不复用编号
         raise
 
 
@@ -98,8 +107,6 @@ def fake_submit_isolation(conn, expected_version, fault_pipe_id, close_pipe_ids,
     STORE.version += 1
     eid = STORE.next_event_id
     STORE.next_event_id += 1
-    import datetime
-
     event = {
         "id": eid,
         "version_before": before,
@@ -149,7 +156,6 @@ def fake_confirm_restore(
         )
     before = STORE.version
     STORE.version += 1
-    import datetime
 
     restored_at = datetime.datetime(2026, 9, 30, 13, 0, 0)
     event["status"] = "restored"
@@ -170,6 +176,88 @@ def fake_switch_sources(conn, expected_version, targets):
     return {"version": STORE.version}
 
 
+# ------------------------------------------------------------ 状态快照替身
+
+
+def _fake_open_faults():
+    return [
+        {
+            "event_id": e["id"],
+            "fault_pipe_id": e["fault_pipe_id"],
+            "closed_pipe_ids": list(e["closed_pipe_ids"]),
+        }
+        for e in sorted(STORE.events, key=lambda e: e["id"])
+        if e.get("status", "open") == "open"
+    ]
+
+
+def fake_freeze_state_snapshot(conn, operation_type, event_id=None):
+    # 复制 db.freeze_state_snapshot：在同一事务内冻结操作后状态，只追加
+    pending = frozenset(f["fault_pipe_id"] for f in _fake_open_faults())
+    payload = {
+        "id": STORE.next_snapshot_id,
+        "operation_type": operation_type,
+        "version": STORE.version,
+        "event_id": event_id,
+        "created_at": SNAPSHOT_TIME,
+        "nodes": [
+            {"id": n.id, "type": n.type, "name": n.name,
+             "running": n.running if n.type == "source" else True}
+            for n in sorted(STORE.nodes.values(), key=lambda n: n.id)
+        ],
+        "pipes": [
+            {"id": p.id, "from": p.from_node, "to": p.to_node,
+             "has_valve": p.has_valve,
+             "valve_closed": p.valve_closed if p.has_valve else None,
+             "name": p.name}
+            for p in sorted(STORE.pipes.values(), key=lambda p: p.id)
+        ],
+        "open_faults": _fake_open_faults(),
+        "supplied_sink_ids": supplied_sink_ids(
+            dict(STORE.nodes), dict(STORE.pipes), pending_fault_pipe_ids=pending
+        ),
+    }
+    sid = STORE.next_snapshot_id
+    STORE.next_snapshot_id += 1
+    STORE.snapshots.append(payload)
+    return sid
+
+
+def fake_get_state_snapshot(conn, snapshot_id):
+    for s in STORE.snapshots:
+        if s["id"] == snapshot_id:
+            return s
+    return None
+
+
+def fake_get_previous_state_snapshot(conn, snapshot_id):
+    earlier = [s for s in STORE.snapshots if s["id"] < snapshot_id]
+    return earlier[-1] if earlier else None
+
+
+def fake_list_state_snapshots(conn, limit, after_id=0):
+    rows = [s for s in STORE.snapshots if s["id"] > after_id]
+    return [
+        {
+            "id": s["id"],
+            "operation_type": s["operation_type"],
+            "version": s["version"],
+            "event_id": s["event_id"],
+            "created_at": s["created_at"],
+            "node_count": len(s["nodes"]),
+            "pipe_count": len(s["pipes"]),
+            "open_fault_count": len(s["open_faults"]),
+            "supplied_sink_count": len(s["supplied_sink_ids"]),
+        }
+        for s in rows[:limit]
+    ]
+
+
+def fake_ensure_baseline_snapshot():
+    # 测试自行控制快照生命周期，不模拟旧库基线
+    return None
+
+
 # 替换数据访问层
 db.get_conn = fake_get_conn
 db.transaction = fake_transaction
@@ -182,6 +270,11 @@ db.get_event = fake_get_event
 db.list_open_events = fake_list_open_events
 db.confirm_restore = fake_confirm_restore
 db.switch_sources = fake_switch_sources
+db.freeze_state_snapshot = fake_freeze_state_snapshot
+db.get_state_snapshot = fake_get_state_snapshot
+db.get_previous_state_snapshot = fake_get_previous_state_snapshot
+db.list_state_snapshots = fake_list_state_snapshots
+db.ensure_baseline_snapshot = fake_ensure_baseline_snapshot
 
 
 VALID_NETWORK = {
@@ -264,6 +357,8 @@ class ApiTests(unittest.TestCase):
         STORE.events = []
         STORE.next_event_id = 1
         STORE.fail_commit = False
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
 
     def _import(self):
         r = self.client.post("/api/network/import", json=VALID_NETWORK)
@@ -1140,6 +1235,300 @@ class ApiTests(unittest.TestCase):
             "/api/sources/switch", json={"targets": [{"running": False}], "version": 1}
         )
         self.assertEqual(r.status_code, 422)
+
+    # ---------------------------------------------------------- 状态快照
+
+    def test_import_freezes_snapshot(self):
+        info = self._import()
+        self.assertEqual(info["snapshot_id"], 1)
+        r = self.client.get("/api/snapshots")
+        self.assertEqual(r.status_code, 200)
+        items = r.json()
+        self.assertEqual([i["id"] for i in items], [1])
+        self.assertEqual(items[0]["operation_type"], "import")
+        self.assertEqual(items[0]["version"], 1)
+        self.assertIsNone(items[0]["event_id"])
+        self.assertEqual(items[0]["node_count"], 7)
+        self.assertEqual(items[0]["pipe_count"], 6)
+        self.assertEqual(items[0]["open_fault_count"], 0)
+        # 初始全部用水点都由运行水源 S 可达
+        self.assertEqual(items[0]["supplied_sink_count"], 3)
+
+        r = self.client.get("/api/snapshots/1")
+        self.assertEqual(r.status_code, 200)
+        snap = r.json()
+        self.assertEqual(snap["operation_type"], "import")
+        self.assertEqual(snap["version"], 1)
+        self.assertEqual(snap["open_faults"], [])
+        self.assertEqual(snap["supplied_sink_ids"], ["U1", "U2", "U3"])
+        p4 = next(p for p in snap["pipes"] if p["id"] == "P4")
+        self.assertFalse(p4["valve_closed"])
+        src = next(n for n in snap["nodes"] if n["id"] == "S")
+        self.assertTrue(src["running"])
+        self.assertEqual(src["type"], "source")
+
+    def test_snapshot_not_found_is_explicit_error(self):
+        r = self.client.get("/api/snapshots/999")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+
+    def test_isolation_submit_freezes_event_snapshot_and_reads_history(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        body = r.json()
+        self.assertEqual(body["snapshot_id"], 2)
+
+        snap = self.client.get("/api/snapshots/2").json()
+        self.assertEqual(snap["operation_type"], "isolation_submit")
+        self.assertEqual(snap["version"], 2)
+        self.assertEqual(snap["event_id"], 1)
+        # 阀位与待修复故障均已冻结
+        self.assertTrue(next(p for p in snap["pipes"] if p["id"] == "P4")["valve_closed"])
+        self.assertEqual(
+            snap["open_faults"],
+            [{"event_id": 1, "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}],
+        )
+        # U3 因关 P4 失供，U1/U2 仍由运行水源可达
+        self.assertEqual(snap["supplied_sink_ids"], ["U1", "U2"])
+
+        # 历史不被当前状态回填：再复供后，旧快照 2 仍是当时状态
+        self.client.post("/api/isolation/events/1/restore", json={"version": 2})
+        snap = self.client.get("/api/snapshots/2").json()
+        self.assertTrue(next(p for p in snap["pipes"] if p["id"] == "P4")["valve_closed"])
+        self.assertEqual(len(snap["open_faults"]), 1)
+        self.assertEqual(snap["supplied_sink_ids"], ["U1", "U2"])
+
+    def test_failed_writes_leave_no_snapshot(self):
+        self._import()
+        # 版本冲突 -> 409，无新快照
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 99},
+        )
+        self.assertEqual(r.status_code, 409)
+        # 不可隔离 -> 422，无新快照
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P5"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 422)
+        # 非法导入 -> 422，无新快照
+        r = self.client.post(
+            "/api/network/import",
+            json={"nodes": [{"id": "S", "type": "source"}],
+                  "pipes": [{"id": "P1", "from": "S", "to": "X"}]},
+        )
+        self.assertEqual(r.status_code, 422)
+        items = self.client.get("/api/snapshots").json()
+        self.assertEqual([i["id"] for i in items], [1])
+
+        # 水源切换：整批目标状态已满足 -> changed=false，版本不变，无新快照
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S", "running": True}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["changed"])
+        self.assertIsNone(r.json()["snapshot_id"])
+        self.assertEqual([i["id"] for i in self.client.get("/api/snapshots").json()], [1])
+
+        # 不安全切换 -> 422，无新快照（双水源网制造重新进水风险场景）
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 第二次导入产生快照 2
+        self.assertEqual(self.client.get("/api/snapshots").json()[-1]["id"], 2)
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q1"], "version": 2},
+        )
+        # 此时快照：import(2?)、switch、submit —— 恢复 S2 不安全应被拒
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": True}], "version": 3},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SOURCE_SWITCH_UNSAFE")
+        ids_before = [i["id"] for i in self.client.get("/api/snapshots").json()]
+        # 导入旧网(1) + 重新导入(2) + 停运 S2(3) + 隔离提交(4)；不安全切换不留快照
+        self.assertEqual(ids_before, [1, 2, 3, 4])
+
+    def test_transaction_failure_leaves_no_snapshot(self):
+        self._import()
+        STORE.fail_commit = True
+        with self.assertRaises(RuntimeError):
+            self.client.post(
+                "/api/isolation/submit",
+                json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+            )
+        # 回滚后快照不保留、编号被消耗但不复用
+        STORE.fail_commit = False
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["snapshot_id"], 3)
+        self.assertEqual(
+            [i["id"] for i in self.client.get("/api/snapshots").json()], [1, 3]
+        )
+
+    def test_reimport_appends_snapshot_without_overwriting_previous(self):
+        self._import()
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        # 重新导入：版本重置为 1，但此前快照仍在且内容不变
+        r = self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["version"], 1)
+        new_sid = r.json()["snapshot_id"]
+        self.assertEqual(new_sid, 3)
+
+        items = self.client.get("/api/snapshots").json()
+        self.assertEqual([i["id"] for i in items], [1, 2, 3])
+        self.assertEqual(items[2]["operation_type"], "import")
+        self.assertEqual(items[2]["version"], 1)
+
+        old = self.client.get("/api/snapshots/2").json()
+        self.assertEqual(old["version"], 2)
+        self.assertEqual(old["operation_type"], "isolation_submit")
+        self.assertEqual(old["event_id"], 1)
+        self.assertTrue(next(p for p in old["pipes"] if p["id"] == "P4")["valve_closed"])
+
+        fresh = self.client.get("/api/snapshots/3").json()
+        self.assertEqual({n["id"] for n in fresh["nodes"]}, {"S1", "S2", "C", "U1", "U2"})
+        self.assertEqual(fresh["supplied_sink_ids"], ["U1", "U2"])
+
+    def test_adjacent_diff_valves_faults_and_supplied_sinks(self):
+        self._import()
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        # 快照 1(import) -> 快照 2(隔离提交)
+        r = self.client.get("/api/snapshots/2/diff")
+        self.assertEqual(r.status_code, 200)
+        diff = r.json()
+        self.assertEqual(diff["base_snapshot_id"], 1)
+        self.assertEqual(diff["target_snapshot_id"], 2)
+        self.assertEqual(diff["base_version"], 1)
+        self.assertEqual(diff["target_version"], 2)
+        self.assertEqual(diff["nodes"]["added"], [])
+        self.assertEqual(diff["nodes"]["removed"], [])
+        self.assertEqual(diff["pipes"]["added"], [])
+        self.assertEqual(diff["valve_positions"]["closed"], ["P4"])
+        self.assertEqual(diff["valve_positions"]["reopened"], [])
+        self.assertEqual(
+            diff["open_faults"]["added"],
+            [{"event_id": 1, "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}],
+        )
+        self.assertEqual(diff["open_faults"]["resolved"], [])
+        self.assertEqual(diff["supplied_sinks"]["newly_lost"], ["U3"])
+        self.assertEqual(diff["supplied_sinks"]["newly_supplied"], [])
+
+        # 复供后 diff：阀位重开、故障解除、U3 恢复供水
+        self.client.post("/api/isolation/events/1/restore", json={"version": 2})
+        r = self.client.get("/api/snapshots/3/diff")
+        diff = r.json()
+        self.assertEqual(diff["base_snapshot_id"], 2)
+        self.assertEqual(diff["valve_positions"]["reopened"], ["P4"])
+        self.assertEqual(diff["valve_positions"]["closed"], [])
+        self.assertEqual(
+            diff["open_faults"]["resolved"],
+            [{"event_id": 1, "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}],
+        )
+        self.assertEqual(diff["supplied_sinks"]["newly_supplied"], ["U3"])
+
+    def test_diff_after_reimport_lists_node_and_pipe_net_changes(self):
+        # 先在双水源网上产生一次水源切换快照
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        # 再导入单水源演示网：节点/管段集合发生净变化，版本重置为 1
+        r = self.client.post("/api/network/import", json=VALID_NETWORK)
+        new_sid = r.json()["snapshot_id"]
+        diff = self.client.get(f"/api/snapshots/{new_sid}/diff").json()
+        added_node_ids = {n["id"] for n in diff["nodes"]["added"]}
+        removed_node_ids = {n["id"] for n in diff["nodes"]["removed"]}
+        self.assertEqual(added_node_ids, {"S", "A", "B", "D", "U3"})
+        self.assertEqual(removed_node_ids, {"S1", "S2", "C"})
+        added_pipe_ids = {p["id"] for p in diff["pipes"]["added"]}
+        removed_pipe_ids = {p["id"] for p in diff["pipes"]["removed"]}
+        self.assertEqual(added_pipe_ids, {"P1", "P2", "P3", "P4", "P5", "P6"})
+        self.assertEqual(removed_pipe_ids, {"Q1", "Q2", "Q3", "Q4"})
+
+    def test_diff_source_state_changes_and_explicit_base(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        # 与指定基线（快照 1）对照：水源运行状态净变化 S1 true->false
+        r = self.client.get("/api/snapshots/2/diff?base_id=1")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            r.json()["source_states"],
+            [{"id": "S1", "running_before": True, "running_after": False}],
+        )
+        # 基线编号未知 -> 明确 404
+        r = self.client.get("/api/snapshots/2/diff?base_id=999")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+        # 相同编号 / 基线晚于目标 -> 422
+        r = self.client.get("/api/snapshots/2/diff?base_id=2")
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_DIFF_SAME_ID")
+        r = self.client.get("/api/snapshots/1/diff?base_id=2")
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_DIFF_BASE_AFTER_TARGET")
+
+    def test_first_snapshot_diff_has_no_baseline(self):
+        self._import()
+        r = self.client.get("/api/snapshots/1/diff")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NO_BASELINE")
+
+    def test_snapshot_list_cursor_pagination(self):
+        self._import()
+        for fault, closes, ver in [("P6", ["P4"], 1), ("P5", ["P2"], 2)]:
+            r = self.client.post(
+                "/api/isolation/submit",
+                json={"fault_pipe_id": fault, "close_pipe_ids": closes, "version": ver},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+        page1 = self.client.get("/api/snapshots?limit=2").json()
+        self.assertEqual([i["id"] for i in page1], [1, 2])
+        page2 = self.client.get("/api/snapshots?after_id=2&limit=2").json()
+        self.assertEqual([i["id"] for i in page2], [3])
+
+    def test_source_switch_snapshot_freezes_running_state(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [
+                {"source_id": "S1", "running": False},
+                {"source_id": "S2", "running": False},
+            ], "version": 1},
+        )
+        sid = r.json()["snapshot_id"]
+        self.assertEqual(sid, 2)
+        snap = self.client.get(f"/api/snapshots/{sid}").json()
+        self.assertEqual(snap["operation_type"], "source_switch")
+        self.assertEqual(snap["version"], 2)
+        self.assertIsNone(snap["event_id"])
+        self.assertFalse(next(n for n in snap["nodes"] if n["id"] == "S1")["running"])
+        self.assertFalse(next(n for n in snap["nodes"] if n["id"] == "S2")["running"])
+        # 全网无运行水源：无可达用水点
+        self.assertEqual(snap["supplied_sink_ids"], [])
 
 
 if __name__ == "__main__":

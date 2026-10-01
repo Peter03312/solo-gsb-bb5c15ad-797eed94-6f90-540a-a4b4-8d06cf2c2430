@@ -106,3 +106,39 @@ def serialize_source_switch_preview(
         "block_reasons": [b.as_dict() for b in result.blocks],
         "issues": [i.as_dict() for i in result.issues],
     }
+
+
+def serialize_state_snapshot(snapshot: dict) -> dict:
+    """冻结载荷 -> GET /api/snapshots/{id} 响应（结构与读网接口一致）。"""
+    return {
+        "id": snapshot["id"],
+        "operation_type": snapshot["operation_type"],
+        "version": snapshot["version"],
+        "event_id": snapshot["event_id"],
+        "created_at": snapshot["created_at"],
+        "nodes": [
+            {"id": n["id"], "type": n["type"], "name": n.get("name"),
+             "running": n.get("running", True)}
+            for n in snapshot["nodes"]
+        ],
+        "pipes": [
+            {
+                "id": p["id"],
+                "from_": p["from"],
+                "to_": p["to"],
+                "has_valve": p["has_valve"],
+                "valve_closed": p.get("valve_closed"),
+                "name": p.get("name"),
+            }
+            for p in snapshot["pipes"]
+        ],
+        "open_faults": [
+            {
+                "event_id": f["event_id"],
+                "fault_pipe_id": f["fault_pipe_id"],
+                "closed_pipe_ids": list(f["closed_pipe_ids"]),
+            }
+            for f in snapshot["open_faults"]
+        ],
+        "supplied_sink_ids": list(snapshot["supplied_sink_ids"]),
+    }

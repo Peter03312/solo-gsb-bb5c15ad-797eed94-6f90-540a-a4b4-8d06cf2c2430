@@ -99,6 +99,8 @@ class ImportOut(BaseModel):
     version: int
     node_count: int
     pipe_count: int
+    # 操作后状态快照编号（导入成功必有；编号不可复用）
+    snapshot_id: int
 
 
 class NetworkOut(BaseModel):
@@ -146,6 +148,8 @@ class SubmitOut(BaseModel):
     closed_pipe_ids: list[str]
     affected_sink_ids: list[str]
     event_id: int
+    # 操作后状态快照编号（提交成功必有）
+    snapshot_id: int
 
 
 class RestoreIn(BaseModel):
@@ -180,6 +184,8 @@ class RestoreOut(BaseModel):
     fault_pipe_id: str
     reopened_pipe_ids: list[str]
     restored_sink_ids: list[str]
+    # 操作后状态快照编号（复供成功必有）
+    snapshot_id: int
 
 
 class SourceTargetOut(BaseModel):
@@ -205,6 +211,8 @@ class SourceSwitchOut(BaseModel):
     targets: list[SourceTargetOut]
     affected_sink_ids: list[str]
     restored_sink_ids: list[str]
+    # 实际改变状态时有快照编号；全部目标状态已满足（changed=false）时为 null
+    snapshot_id: int | None = None
 
 
 class EventOut(BaseModel):
@@ -217,3 +225,111 @@ class EventOut(BaseModel):
     status: str = "open"
     restored_at: datetime | None = None
     created_at: datetime
+
+
+# ---------------------------------------------------------------- 状态快照
+
+
+class SnapshotNodeOut(NodeOut):
+    pass
+
+
+class SnapshotPipeOut(PipeOut):
+    pass
+
+
+class SnapshotOpenFaultOut(BaseModel):
+    """快照冻结时的待修复故障。"""
+
+    event_id: int
+    fault_pipe_id: str
+    closed_pipe_ids: list[str]
+
+
+class SnapshotListItemOut(BaseModel):
+    """快照列表项：只含元数据与计数，载荷按编号单读获取。"""
+
+    id: int
+    operation_type: str
+    version: int
+    event_id: int | None = None
+    created_at: datetime
+    node_count: int
+    pipe_count: int
+    open_fault_count: int
+    supplied_sink_count: int
+
+
+class SnapshotOut(BaseModel):
+    """按编号回看当时的完整冻结状态。"""
+
+    id: int
+    operation_type: str
+    version: int
+    event_id: int | None = None
+    created_at: datetime
+    nodes: list[SnapshotNodeOut]
+    pipes: list[SnapshotPipeOut]
+    open_faults: list[SnapshotOpenFaultOut]
+    # 由当时运行水源可达的用水点（冻结值，不用当前管网回填）
+    supplied_sink_ids: list[str]
+
+
+class _SnapshotNodeChangeOut(BaseModel):
+    id: str
+    before: dict
+    after: dict
+
+
+class _SnapshotPipeChangeOut(BaseModel):
+    id: str
+    before: dict
+    after: dict
+
+
+class _SnapshotNodeDeltaOut(BaseModel):
+    added: list[dict]
+    removed: list[dict]
+    changed: list[_SnapshotNodeChangeOut]
+
+
+class _SnapshotPipeDeltaOut(BaseModel):
+    added: list[dict]
+    removed: list[dict]
+    changed: list[_SnapshotPipeChangeOut]
+
+
+class _SnapshotValveDeltaOut(BaseModel):
+    closed: list[str]
+    reopened: list[str]
+
+
+class _SnapshotSourceStateDeltaOut(BaseModel):
+    id: str
+    running_before: bool
+    running_after: bool
+
+
+class _SnapshotFaultDeltaOut(BaseModel):
+    added: list[SnapshotOpenFaultOut]
+    resolved: list[SnapshotOpenFaultOut]
+
+
+class _SnapshotSuppliedDeltaOut(BaseModel):
+    newly_supplied: list[str]
+    newly_lost: list[str]
+
+
+class SnapshotDiffOut(BaseModel):
+    """相邻（或指定基线）快照之间的六类净变化。"""
+
+    base_snapshot_id: int
+    target_snapshot_id: int
+    base_version: int
+    target_version: int
+    nodes: _SnapshotNodeDeltaOut
+    source_states: list[_SnapshotSourceStateDeltaOut]
+    pipes: _SnapshotPipeDeltaOut
+    valve_positions: _SnapshotValveDeltaOut
+    open_faults: _SnapshotFaultDeltaOut
+    supplied_sinks: _SnapshotSuppliedDeltaOut

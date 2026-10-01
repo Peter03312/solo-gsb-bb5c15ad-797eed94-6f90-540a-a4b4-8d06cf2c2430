@@ -16,6 +16,8 @@ from app.planning import (  # noqa: E402
     evaluate_source_switch,
     recommend_plan,
     validate_import,
+    supplied_sink_ids,
+    diff_state_snapshots,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
     PIPE_SELF_LOOP,
@@ -578,6 +580,132 @@ class SourceSwitchPlanningTests(unittest.TestCase):
         plan = evaluate_plan(nodes, pipes, "Q2", [])
         self.assertTrue(plan.isolatable)
         self.assertEqual(plan.affected_sink_ids, [])
+
+
+def _freeze_payload(snap_id, version, nodes, pipes, open_faults=None):
+    """构造 diff_state_snapshots 消费的冻结载荷（与 db._snapshot_row_to_dict 同构）。"""
+    return {
+        "id": snap_id,
+        "version": version,
+        "nodes": [
+            {"id": n.id, "type": n.type, "name": n.name,
+             "running": n.running if n.type == "source" else True}
+            for n in sorted(nodes.values(), key=lambda n: n.id)
+        ],
+        "pipes": [
+            {"id": p.id, "from": p.from_node, "to": p.to_node,
+             "has_valve": p.has_valve,
+             "valve_closed": p.valve_closed if p.has_valve else None,
+             "name": p.name}
+            for p in sorted(pipes.values(), key=lambda p: p.id)
+        ],
+        "open_faults": list(open_faults or []),
+        "supplied_sink_ids": supplied_sink_ids(
+            nodes,
+            pipes,
+            pending_fault_pipe_ids=frozenset(f["fault_pipe_id"] for f in (open_faults or [])),
+        ),
+    }
+
+
+class StateSnapshotPlanningTests(unittest.TestCase):
+    def test_supplied_sink_ids_respects_valves_sources_and_faults(self):
+        nodes, pipes = build_demo()
+        self.assertEqual(supplied_sink_ids(nodes, pipes), ["U1", "U2", "U3"])
+        # 关 P4：U3 失供
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        self.assertEqual(supplied_sink_ids(nodes, pipes), ["U1", "U2"])
+        # 待修复故障 P6 同样阻断 U3
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True)
+        self.assertEqual(
+            supplied_sink_ids(nodes, pipes, pending_fault_pipe_ids=frozenset({"P6"})),
+            ["U1", "U2"],
+        )
+        # 无运行水源：无可达用水点
+        nodes["S"] = Node("S", "source", running=False)
+        self.assertEqual(supplied_sink_ids(nodes, pipes), [])
+
+    def test_diff_valves_faults_and_supplied_sinks(self):
+        nodes, pipes = build_demo()
+        before = _freeze_payload(1, 1, nodes, pipes)
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        fault = {"event_id": 1, "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}
+        after = _freeze_payload(2, 2, nodes, pipes, open_faults=[fault])
+
+        diff = diff_state_snapshots(before, after)
+        self.assertEqual(diff["base_snapshot_id"], 1)
+        self.assertEqual(diff["target_snapshot_id"], 2)
+        self.assertEqual(diff["valve_positions"]["closed"], ["P4"])
+        self.assertEqual(diff["valve_positions"]["reopened"], [])
+        self.assertEqual(diff["open_faults"]["added"], [fault])
+        self.assertEqual(diff["open_faults"]["resolved"], [])
+        self.assertEqual(diff["supplied_sinks"]["newly_lost"], ["U3"])
+        self.assertEqual(diff["supplied_sinks"]["newly_supplied"], [])
+        self.assertEqual(diff["nodes"]["added"], [])
+        self.assertEqual(diff["pipes"]["added"], [])
+        self.assertEqual(diff["source_states"], [])
+
+    def test_diff_reopen_restore_and_source_running(self):
+        nodes, pipes = build_demo()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        fault = {"event_id": 1, "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}
+        before = _freeze_payload(2, 2, nodes, pipes, open_faults=[fault])
+
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True)
+        # 复供后水源仍运行：U3 恢复，故障解除
+        after = _freeze_payload(3, 3, nodes, pipes)
+        diff = diff_state_snapshots(before, after)
+        self.assertEqual(diff["valve_positions"]["reopened"], ["P4"])
+        self.assertEqual(diff["open_faults"]["resolved"], [fault])
+        self.assertEqual(diff["supplied_sinks"]["newly_supplied"], ["U3"])
+
+        # 水源停运只影响 source_states 与供水点
+        nodes2, pipes2 = build_demo()
+        b2 = _freeze_payload(1, 1, nodes2, pipes2)
+        nodes2["S"] = Node("S", "source", running=False)
+        a2 = _freeze_payload(2, 2, nodes2, pipes2)
+        d2 = diff_state_snapshots(b2, a2)
+        self.assertEqual(
+            d2["source_states"],
+            [{"id": "S", "running_before": True, "running_after": False}],
+        )
+        self.assertEqual(d2["supplied_sinks"]["newly_lost"], ["U1", "U2", "U3"])
+        self.assertEqual(d2["nodes"]["changed"], [])
+
+    def test_diff_node_and_pipe_added_removed(self):
+        nodes, pipes = build_demo()
+        before = _freeze_payload(1, 1, nodes, pipes)
+        after = _freeze_payload(2, 1, nodes, pipes)
+        # 模拟整网替换：删掉 P6/U3/D，新增 X/P9
+        after_nodes = [n for n in after["nodes"] if n["id"] not in {"U3", "D"}]
+        after_nodes.append({"id": "X", "type": "junction", "name": None, "running": True})
+        after["nodes"] = sorted(after_nodes, key=lambda n: n["id"])
+        after["pipes"] = [
+            p for p in after["pipes"] if p["id"] != "P6"
+        ] + [{"id": "P9", "from": "B", "to": "X", "has_valve": False,
+              "valve_closed": None, "name": None}]
+        after["pipes"].sort(key=lambda p: p["id"])
+        after["supplied_sink_ids"] = [s for s in after["supplied_sink_ids"] if s != "U3"]
+
+        diff = diff_state_snapshots(before, after)
+        self.assertEqual({n["id"] for n in diff["nodes"]["added"]}, {"X"})
+        self.assertEqual({n["id"] for n in diff["nodes"]["removed"]}, {"D", "U3"})
+        self.assertEqual({p["id"] for p in diff["pipes"]["added"]}, {"P9"})
+        self.assertEqual({p["id"] for p in diff["pipes"]["removed"]}, {"P6"})
+        self.assertEqual(diff["supplied_sinks"]["newly_lost"], ["U3"])
+
+    def test_diff_is_pure_over_frozen_payloads(self):
+        # 同一载荷对照两次，结果一致；改动当前领域对象不影响已冻结载荷
+        nodes, pipes = build_demo()
+        before = _freeze_payload(1, 1, nodes, pipes)
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        after = _freeze_payload(2, 2, nodes, pipes)
+        d1 = diff_state_snapshots(before, after)
+        # 事后再“改管网”，冻结的 before/after 不被回填
+        pipes["P1"] = Pipe("P1", "S", "A", has_valve=True, valve_closed=True)
+        d2 = diff_state_snapshots(before, after)
+        self.assertEqual(d1, d2)
+        self.assertEqual(d2["valve_positions"]["closed"], ["P4"])
 
 
 if __name__ == "__main__":
